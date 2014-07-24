@@ -38,54 +38,39 @@ LOG = logging.getLogger(__name__)
 
 
 def safe_for_db_retry(f):
-    """Indicate api method as safe for re-connection to database.
+    """Enable db-retry for decorated function, if config option enabled.
 
-    Database connection retries will be enabled for the decorated api method.
-    Database connection failure can have many causes, which can be temporary.
-    In such cases retry may increase the likelihood of connection.
-
-    Usage::
-
-        @safe_for_db_retry
-        def api_method(self):
-            self.engine.connect()
-
-
-    :param f: database api method.
-    :type f: function.
+    If we enabled `use_db_reconnect` in config, wrap_db_retry will be
+    applied to all db.api functions, marked with this decorator.
     """
-    f.__dict__['enable_retry'] = True
+    f.__dict__['enable_retry_on_disconnect'] = True
+    return f
+
+
+def retry_on_deadlock(f):
+    """Retry a DB API call if Deadlock was received.
+
+    wrap_db_entry will be applied to all db.api functions marked with this
+    decorator.
+    """
+    f.__dict__['retry_on_deadlock'] = True
     return f
 
 
 class wrap_db_retry(object):
-    """Decorator class. Retry db.api methods, if DBConnectionError() raised.
+    """Retry db.api methods, if db_error raised
 
-    Retry decorated db.api methods. If we enabled `use_db_reconnect`
-    in config, this decorator will be applied to all db.api functions,
-    marked with @safe_for_db_retry decorator.
-    Decorator catches DBConnectionError() and retries function in a
-    loop until it succeeds, or until maximum retries count will be reached.
-
-    Keyword arguments:
-
-    :param retry_interval: seconds between transaction retries
-    :type retry_interval: int
-
-    :param max_retries: max number of retries before an error is raised
-    :type max_retries: int
-
-    :param inc_retry_interval: determine increase retry interval or not
-    :type inc_retry_interval: bool
-
-    :param max_retry_interval: max interval value between retries
-    :type max_retry_interval: int
+    Retry decorated db.api methods. This decorator catches db_error and retries
+    function in a loop until it succeeds, or until maximum retries count
+    will be reached. If maximum retries is not set it will loop until the
+    function succeeds
     """
 
-    def __init__(self, retry_interval, max_retries, inc_retry_interval,
-                 max_retry_interval):
+    def __init__(self, db_error, retry_interval, max_retries,
+                 inc_retry_interval=None, max_retry_interval=None):
         super(wrap_db_retry, self).__init__()
 
+        self.db_error = db_error
         self.retry_interval = retry_interval
         self.max_retries = max_retries
         self.inc_retry_interval = inc_retry_interval
@@ -96,17 +81,19 @@ class wrap_db_retry(object):
         def wrapper(*args, **kwargs):
             next_interval = self.retry_interval
             remaining = self.max_retries
+            db_error = self.db_error
 
             while True:
                 try:
                     return f(*args, **kwargs)
-                except exception.DBConnectionError as e:
-                    if remaining == 0:
-                        LOG.exception(_LE('DB exceeded retry limit.'))
-                        raise exception.DBError(e)
-                    if remaining != -1:
-                        remaining -= 1
-                        LOG.exception(_LE('DB connection error.'))
+                except db_error as e:
+                    if self.max_retries:
+                        if remaining == 0:
+                            LOG.exception(_LE('DB exceeded retry limit.'))
+                            raise exception.DBError(e)
+                        if remaining != -1:
+                            remaining -= 1
+                    LOG.exception(_LE('DB error.'))
                     # NOTE(vsergeyev): We are using patched time module, so
                     #                  this effectively yields the execution
                     #                  context to another green thread.
@@ -189,12 +176,20 @@ class DBAPI(object):
         # NOTE(vsergeyev): If `use_db_reconnect` option is set to True, retry
         #                  DB API methods, decorated with @safe_for_db_retry
         #                  on disconnect.
-        if self.use_db_reconnect and hasattr(attr, 'enable_retry'):
+        if self.use_db_reconnect and hasattr(attr,
+                                             'enable_retry_on_disconnect'):
             attr = wrap_db_retry(
+                exception.DBConnectionError,
                 retry_interval=self.retry_interval,
                 max_retries=self.max_retries,
                 inc_retry_interval=self.inc_retry_interval,
                 max_retry_interval=self.max_retry_interval)(attr)
+
+        if hasattr(attr, 'retry_on_deadlock'):
+            attr = wrap_db_retry(
+                exception.DBDeadlock,
+                retry_interval=self.retry_interval,
+                max_retries=None)(attr)
 
         return attr
 
